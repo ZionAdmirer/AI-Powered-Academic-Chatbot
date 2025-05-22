@@ -1,0 +1,412 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Academic Chatbot Serverless Application
+
+Parameters:
+  Stage:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+  
+Globals:
+  Function:
+    Runtime: python3.9
+    Timeout: 30
+    MemorySize: 1024
+    Environment:
+      Variables:
+        STAGE: !Ref Stage
+        MODEL_BUCKET: !Ref ModelBucket
+
+Resources:
+  ModelBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'academic-chatbot-models-${Stage}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ChatbotFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'academic-chatbot-${Stage}'
+      CodeUri: src/
+      Handler: lambda_handler.lambda_handler
+      ReservedConcurrencyLimit: 50
+      Environment:
+        Variables:
+          MODEL_BUCKET: !Ref ModelBucket
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref ModelBucket
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: '*'
+      Events:
+        ChatbotApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChatbotApi
+            Path: /chat
+            Method: post
+        ChatbotOptionsApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChatbotApi
+            Path: /chat
+            Method: options
+
+  HealthCheckFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'academic-chatbot-health-${Stage}'
+      CodeUri: src/
+      Handler: lambda_handler.health_check_handler
+      Environment:
+        Variables:
+          MODEL_BUCKET: !Ref ModelBucket
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref ModelBucket
+      Events:
+        HealthCheckApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChatbotApi
+            Path: /health
+            Method: get
+
+  BatchProcessFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'academic-chatbot-batch-${Stage}'
+      CodeUri: src/
+      Handler: lambda_handler.batch_process_handler
+      Timeout: 300
+      MemorySize: 2048
+      Environment:
+        Variables:
+          MODEL_BUCKET: !Ref ModelBucket
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref ModelBucket
+      Events:
+        BatchProcessApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ChatbotApi
+            Path: /batch
+            Method: post
+
+  ChatbotApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub 'academic-chatbot-api-${Stage}'
+      StageName: !Ref Stage
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+      DefinitionBody:
+        openapi: 3.0.1
+        info:
+          title: Academic Chatbot API
+          version: '1.0'
+        paths:
+          /chat:
+            post:
+              summary: Process student query
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      type: object
+                      properties:
+                        query:
+                          type: string
+                          description: Student query text
+                      required:
+                        - query
+              responses:
+                '200':
+                  description: Successful response
+                  content:
+                    application/json:
+                      schema:
+                        type: object
+                        properties:
+                          query:
+                            type: string
+                          intent:
+                            type: string
+                          confidence:
+                            type: number
+                          response:
+                            type: string
+                          quick_actions:
+                            type: array
+                            items:
+                              type: string
+                          processing_time_ms:
+                            type: number
+                          timestamp:
+                            type: integer
+                '400':
+                  description: Bad request
+                '500':
+                  description: Internal server error
+            options:
+              summary: CORS preflight
+              responses:
+                '200':
+                  description: CORS headers
+          /health:
+            get:
+              summary: Health check endpoint
+              responses:
+                '200':
+                  description: Service healthy
+                  content:
+                    application/json:
+                      schema:
+                        type: object
+                        properties:
+                          status:
+                            type: string
+                          model_loaded:
+                            type: boolean
+                          test_inference_time_ms:
+                            type: number
+                          timestamp:
+                            type: integer
+                '500':
+                  description: Service unhealthy
+          /batch:
+            post:
+              summary: Batch process multiple queries
+              requestBody:
+                required: true
+                content:
+                  application/json:
+                    schema:
+                      type: object
+                      properties:
+                        queries:
+                          type: array
+                          items:
+                            type: string
+                      required:
+                        - queries
+              responses:
+                '200':
+                  description: Batch processing results
+                  content:
+                    application/json:
+                      schema:
+                        type: object
+                        properties:
+                          results:
+                            type: array
+                            items:
+                              type: object
+                          total_queries:
+                            type: integer
+                          total_processing_time_ms:
+                            type: number
+                          average_processing_time_ms:
+                            type: number
+                          timestamp:
+                            type: integer
+
+  ChatbotLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/academic-chatbot-${Stage}'
+      RetentionInDays: 14
+
+  HealthCheckLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/academic-chatbot-health-${Stage}'
+      RetentionInDays: 14
+
+  BatchProcessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/academic-chatbot-batch-${Stage}'
+      RetentionInDays: 14
+
+  ChatbotApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: !Sub 'academic-chatbot-usage-plan-${Stage}'
+      Description: Usage plan for Academic Chatbot API
+      ApiStages:
+        - ApiId: !Ref ChatbotApi
+          Stage: !Ref Stage
+      Throttle:
+        RateLimit: 1000
+        BurstLimit: 2000
+      Quota:
+        Limit: 50000
+        Period: DAY
+
+  ChatbotApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub 'academic-chatbot-api-key-${Stage}'
+      Description: API Key for Academic Chatbot
+      Enabled: true
+
+  ChatbotUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ChatbotApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref ChatbotApiUsagePlan
+
+  ChatbotDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'AcademicChatbot-${Stage}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${ChatbotFunction}" ],
+                  [ ".", "Errors", ".", "." ],
+                  [ ".", "Duration", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Metrics",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApiGateway", "Count", "ApiName", "${ChatbotApi}" ],
+                  [ ".", "Latency", ".", "." ],
+                  [ ".", "4XXError", ".", "." ],
+                  [ ".", "5XXError", ".", "." ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "API Gateway Metrics",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+  ModelUploadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'academic-chatbot-model-upload-role-${Stage}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ModelUploadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub '${ModelBucket}/*'
+
+  CacheWarmupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'academic-chatbot-warmup-${Stage}'
+      CodeUri: src/
+      Handler: warmup.warmup_handler
+      Runtime: python3.9
+      Timeout: 60
+      Environment:
+        Variables:
+          CHATBOT_FUNCTION_NAME: !Ref ChatbotFunction
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !GetAtt ChatbotFunction.Arn
+      Events:
+        WarmupSchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Input: '{"warmup": true}'
+
+Outputs:
+  ChatbotApiUrl:
+    Description: API Gateway endpoint URL for Chatbot function
+    Value: !Sub 'https://${ChatbotApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/chat'
+    Export:
+      Name: !Sub '${AWS::StackName}-ChatbotApiUrl'
+
+  HealthCheckUrl:
+    Description: Health check endpoint URL
+    Value: !Sub 'https://${ChatbotApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/health'
+    Export:
+      Name: !Sub '${AWS::StackName}-HealthCheckUrl'
+
+  BatchProcessUrl:
+    Description: Batch processing endpoint URL
+    Value: !Sub 'https://${ChatbotApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/batch'
+    Export:
+      Name: !Sub '${AWS::StackName}-BatchProcessUrl'
+
+  ModelBucketName:
+    Description: S3 bucket name for storing models
+    Value: !Ref ModelBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ModelBucket'
+
+  ApiKeyId:
+    Description: API Key ID for accessing the chatbot
+    Value: !Ref ChatbotApiKey
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiKey'
+
+  DashboardUrl:
+    Description: CloudWatch Dashboard URL
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ChatbotDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-Dashboard'
